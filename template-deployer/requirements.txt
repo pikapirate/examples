@@ -1,0 +1,8 @@
+# Core dependencies
+httpx>=0.24.0
+tensorlake>=0.1.0
+
+# Dependencies needed to parse template source code
+# When load_code() imports a template, these must be available
+# Add any imports used by templates in the examples repo
+beautifulsoup4>=4.12.0
