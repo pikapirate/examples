@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 
 import httpx
-from tensorlake.applications import application, function, Retries
+from tensorlake.applications import application, function, Retries, Image
+
+# Custom image with dependencies needed to parse template source code
+deployer_image = Image().run("pip install httpx beautifulsoup4")
 
 
 # Files to exclude from deployment package
@@ -55,7 +58,7 @@ class FileToFetch:
 
 @application(input_deserializer="json", output_serializer="json")
 @function(timeout=180, secrets=["TENSORLAKE_DEPLOYER_API_KEY"])
-def deploy_template(request: DeployRequest) -> DeployResult:
+def deploy_template(request: dict) -> dict:
     """
     Deploy a template from a GitHub repository.
 
@@ -68,30 +71,39 @@ def deploy_template(request: DeployRequest) -> DeployResult:
     This is Tensorlake deploying Tensorlake - the same code path
     as the CLI, orchestrated as a distributed application.
     """
+    # Parse request dict into dataclass
+    req = DeployRequest(
+        template_id=request["template_id"],
+        target_namespace=request["target_namespace"],
+        app_name=request["app_name"],
+        github_repo=request.get("github_repo", "tensorlakeai/examples"),
+        github_branch=request.get("github_branch", "main"),
+    )
+
     # Stage 1: Discover files in the template directory
     discovery = discover_template_files(
-        repo=request.github_repo,
-        branch=request.github_branch,
-        template_id=request.template_id,
+        repo=req.github_repo,
+        branch=req.github_branch,
+        template_id=req.template_id,
     )
 
     if discovery.get("error"):
-        return DeployResult(success=False, error=discovery["error"])
+        return {"success": False, "error": discovery["error"]}
 
     files_to_fetch: List[FileToFetch] = discovery["files"]
 
     if not files_to_fetch:
-        return DeployResult(
-            success=False,
-            error=f"Template '{request.template_id}' is empty or not found"
-        )
+        return {
+            "success": False,
+            "error": f"Template '{req.template_id}' is empty or not found"
+        }
 
     # Validate main.py exists
     if not any(f.name == "main.py" for f in files_to_fetch):
-        return DeployResult(
-            success=False,
-            error=f"Template '{request.template_id}' is missing main.py"
-        )
+        return {
+            "success": False,
+            "error": f"Template '{req.template_id}' is missing main.py"
+        }
 
     # Stage 2: Fetch all files in parallel using map()
     # Each file download runs in its own container
@@ -102,17 +114,17 @@ def deploy_template(request: DeployRequest) -> DeployResult:
     files: Dict[str, str] = {}
     for file_meta, content in zip(files_to_fetch, file_contents):
         if content is None:
-            return DeployResult(
-                success=False,
-                error=f"Failed to download {file_meta.name}"
-            )
+            return {
+                "success": False,
+                "error": f"Failed to download {file_meta.name}"
+            }
         files[file_meta.name] = content
 
     # Stage 3: Generate manifest using SDK internals
-    manifest_result = generate_manifest(files["main.py"], request.app_name)
+    manifest_result = generate_manifest(files["main.py"], req.app_name)
 
     if manifest_result.get("error"):
-        return DeployResult(success=False, error=manifest_result["error"])
+        return {"success": False, "error": manifest_result["error"]}
 
     # Stage 4: Create deployment package and deploy
     code_zip = create_zip(files)
@@ -120,18 +132,18 @@ def deploy_template(request: DeployRequest) -> DeployResult:
     deploy_result = deploy_to_namespace(
         manifest_json=manifest_result["manifest_json"],
         code_zip=code_zip,
-        namespace=request.target_namespace,
+        namespace=req.target_namespace,
     )
 
     if not deploy_result["success"]:
-        return DeployResult(success=False, error=deploy_result.get("error"))
+        return {"success": False, "error": deploy_result.get("error")}
 
-    return DeployResult(
-        success=True,
-        app_name=request.app_name,
-        invoke_url=f"https://api.tensorlake.ai/v1/namespaces/{request.target_namespace}/applications/{request.app_name}/invoke",
-        files_deployed=list(files.keys()),
-    )
+    return {
+        "success": True,
+        "app_name": req.app_name,
+        "invoke_url": f"https://api.tensorlake.ai/applications/{req.app_name}",
+        "files_deployed": list(files.keys()),
+    }
 
 
 @function(timeout=30, retries=Retries(max_retries=2))
@@ -215,7 +227,7 @@ def fetch_file(download_url: str) -> Optional[str]:
         return None
 
 
-@function(timeout=60)
+@function(timeout=60, image=deployer_image)
 def generate_manifest(main_py_content: str, app_name: str) -> dict:
     """
     Generate application manifest from Python source code.
