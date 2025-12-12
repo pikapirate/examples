@@ -4,17 +4,15 @@ Template Deployer - Deploy Tensorlake applications from GitHub.
 This application demonstrates:
 - GitHub API integration for dynamic file discovery
 - Parallel file fetching using map() - N files = N containers
-- SDK internals for manifest generation (same as CLI)
+- CLI-based deployment (same code path as manual deployment)
 - Multi-stage orchestration with proper error handling
 
 No hardcoded file lists. The deployer discovers what files exist
 in a template directory and fetches them all in parallel.
 """
 
-import io
 import os
 import tempfile
-import zipfile
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 
@@ -57,7 +55,7 @@ class FileToFetch:
 
 
 @application(input_deserializer="json", output_serializer="json")
-@function(timeout=180, secrets=["TENSORLAKE_DEPLOYER_API_KEY"])
+@function(timeout=180)
 def deploy_template(request: dict) -> dict:
     """
     Deploy a template from a GitHub repository.
@@ -65,8 +63,7 @@ def deploy_template(request: dict) -> dict:
     Pipeline:
     1. Discover files via GitHub API (no hardcoded file list)
     2. Fetch all files in parallel using map()
-    3. Generate manifest using SDK internals
-    4. Create zip and deploy to target namespace
+    3. Deploy using tensorlake CLI
 
     This is Tensorlake deploying Tensorlake - the same code path
     as the CLI, orchestrated as a distributed application.
@@ -120,29 +117,26 @@ def deploy_template(request: dict) -> dict:
             }
         files[file_meta.name] = content
 
-    # Stage 3: Generate manifest using SDK internals
-    manifest_result = generate_manifest(files["main.py"], req.app_name)
-
-    if manifest_result.get("error"):
-        return {"success": False, "error": manifest_result["error"]}
-
-    # Stage 4: Create deployment package and deploy
-    code_zip = create_zip(files)
-
-    deploy_result = deploy_to_namespace(
-        manifest_json=manifest_result["manifest_json"],
-        code_zip=code_zip,
+    # Stage 3: Deploy using tensorlake CLI
+    deploy_result = deploy_via_cli(
+        files=files,
         namespace=req.target_namespace,
     )
 
     if not deploy_result["success"]:
-        return {"success": False, "error": deploy_result.get("error")}
+        return {
+            "success": False,
+            "error": deploy_result.get("error"),
+            "stderr": deploy_result.get("stderr"),
+            "stdout": deploy_result.get("stdout"),
+        }
 
     return {
         "success": True,
         "app_name": req.app_name,
         "invoke_url": f"https://api.tensorlake.ai/applications/{req.app_name}",
         "files_deployed": list(files.keys()),
+        "deploy_output": deploy_result.get("stdout"),
     }
 
 
@@ -227,74 +221,15 @@ def fetch_file(download_url: str) -> Optional[str]:
         return None
 
 
-@function(timeout=60, image=deployer_image)
-def generate_manifest(main_py_content: str, app_name: str) -> dict:
+@function(timeout=120, image=deployer_image, secrets=["TENSORLAKE_DEPLOYER_API_KEY"])
+def deploy_via_cli(files: Dict[str, str], namespace: str) -> dict:
     """
-    Generate application manifest from Python source code.
+    Deploy application using tensorlake CLI.
 
-    Uses Tensorlake SDK internals - the exact same code path as
-    the `tensorlake deploy` CLI command:
-
-    1. Write source to temp file
-    2. load_code() executes decorators, registers functions
-    3. create_application_manifest() builds the manifest
-    4. Serialize to JSON
-
-    No pre-generated manifests needed - always fresh from source.
+    Writes files to temp directory and runs `tensorlake deploy`.
+    This uses the exact same code path as manual CLI deployment.
     """
-    from tensorlake.cli.deploy import load_code, get_functions
-    from tensorlake.applications.remote.manifests.application import create_application_manifest
-    from tensorlake.applications import registry
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        main_path = os.path.join(tmpdir, "main.py")
-
-        with open(main_path, "w") as f:
-            f.write(main_py_content)
-
-        try:
-            # Clear registry to ensure isolation between deployments
-            registry._function_registry.clear()
-            registry._class_registry.clear()
-            registry._decorators.clear()
-
-            # Load code - this executes decorators and registers functions
-            load_code(main_path)
-
-            # Get registered functions
-            functions = get_functions()
-
-            if not functions:
-                return {"error": "No @function decorated functions found in main.py"}
-
-            # Find the @application decorated function (entrypoint)
-            app_func = None
-            for func in functions:
-                if func._application_config is not None:
-                    app_func = func
-                    break
-
-            if app_func is None:
-                return {"error": "No @application decorated function found in main.py"}
-
-            # Generate manifest using SDK
-            manifest = create_application_manifest(app_func, functions)
-            manifest.name = app_name
-
-            return {"manifest_json": manifest.model_dump_json()}
-
-        except Exception as e:
-            return {"error": f"Failed to parse source code: {str(e)}"}
-
-
-@function(timeout=60, secrets=["TENSORLAKE_DEPLOYER_API_KEY"])
-def deploy_to_namespace(manifest_json: str, code_zip: bytes, namespace: str) -> dict:
-    """
-    Deploy application to target namespace via Tensorlake API.
-
-    Uses SDK's APIClient - the same client that powers the CLI.
-    """
-    from tensorlake.applications.remote.api_client import APIClient
+    import subprocess
 
     api_key = os.environ.get("TENSORLAKE_DEPLOYER_API_KEY")
     if not api_key:
@@ -303,25 +238,54 @@ def deploy_to_namespace(manifest_json: str, code_zip: bytes, namespace: str) -> 
             "error": "TENSORLAKE_DEPLOYER_API_KEY secret not configured"
         }
 
-    client = APIClient(api_key=api_key, namespace=namespace)
-
-    try:
-        client.upsert_application(
-            manifest_json=manifest_json,
-            code_zip=code_zip,
-            upgrade_running_requests=True,
-        )
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-    finally:
-        client.close()
-
-
-def create_zip(files: Dict[str, str]) -> bytes:
-    """Create a zip file in memory from files dictionary."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write all files to temp directory
         for filename, content in files.items():
-            zf.writestr(filename, content)
-    return buffer.getvalue()
+            filepath = os.path.join(tmpdir, filename)
+            with open(filepath, "w") as f:
+                f.write(content)
+
+        main_path = os.path.join(tmpdir, "main.py")
+
+        try:
+            # Run tensorlake deploy with API key via environment variable
+            env = os.environ.copy()
+            env["TENSORLAKE_API_KEY"] = api_key
+
+            result = subprocess.run(
+                [
+                    "tensorlake",
+                    "--namespace", namespace,
+                    "deploy", main_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                cwd=tmpdir,
+                env=env,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"tensorlake deploy failed",
+                    "stderr": result.stderr,
+                    "stdout": result.stdout,
+                }
+
+            return {
+                "success": True,
+                "stdout": result.stdout,
+            }
+
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Deployment timed out"}
+        except Exception as e:
+            import traceback
+            return {
+                "success": False,
+                "error": f"Deployment failed: {str(e)}",
+                "traceback": traceback.format_exc()
+            }
+
+
